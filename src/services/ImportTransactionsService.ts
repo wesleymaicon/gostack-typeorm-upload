@@ -1,14 +1,10 @@
-import path from 'path';
 import fs from 'fs';
 import csvParse from 'csv-parse';
+import { In, getRepository, getCustomRepository } from 'typeorm';
+
 import Transaction from '../models/Transaction';
-
-import uploadConfig from '../config/upload';
-import CreateTransactionService from './CreateTransactionService';
-
-interface Request {
-  filename: string;
-}
+import Category from '../models/Category';
+import TransactionsRepository from '../repositories/TransactionsRepository';
 
 interface TransactionData {
   title: string;
@@ -18,23 +14,27 @@ interface TransactionData {
 }
 
 class ImportTransactionsService {
-  async execute({ filename }: Request): Promise<Transaction[]> {
-    const filePath = path.join(uploadConfig.directory, filename);
-
-    const transactionsData: TransactionData[] = [];
-
-    const createTransaction = new CreateTransactionService();
+  async execute(filePath: string): Promise<Transaction[]> {
+    const transactionsRepository = getCustomRepository(TransactionsRepository);
+    const categoriesRepository = getRepository(Category);
 
     const readStream = fs.createReadStream(filePath);
 
     const parseCSV = readStream.pipe(csvParse({ from_line: 2 }));
+
+    const transactions: TransactionData[] = [];
+    const categories: string[] = [];
 
     parseCSV.on('data', async line => {
       const [title, type, value, category] = line.map((cell: string) =>
         cell.trim(),
       );
 
-      transactionsData.push({
+      if (!title || !type || !value) return;
+
+      categories.push(category);
+
+      transactions.push({
         title,
         type,
         value,
@@ -44,26 +44,46 @@ class ImportTransactionsService {
 
     await new Promise(resolve => parseCSV.on('end', resolve));
 
-    const transactions: Transaction[] = [];
+    const existentCategories = await categoriesRepository.find({
+      where: {
+        title: In(categories),
+      },
+    });
 
-    // eslint-disable-next-line no-plusplus
-    for (let index = 0; index < transactionsData.length; index++) {
-      const { title, type, value, category } = transactionsData[index];
+    const existentCategoriesTitles = existentCategories.map(
+      (category: Category) => category.title,
+    );
 
-      // eslint-disable-next-line no-await-in-loop
-      const transaction = await createTransaction.execute({
+    const addCategoriesTitles = categories
+      .filter(category => !existentCategoriesTitles.includes(category))
+      .filter((value, index, self) => self.indexOf(value) === index);
+
+    const newCategories = categoriesRepository.create(
+      addCategoriesTitles.map(title => ({
         title,
-        type,
-        value,
-        category,
-      });
+      })),
+    );
 
-      transactions.push(transaction);
-    }
+    await categoriesRepository.save(newCategories);
+
+    const finalCategories = [...newCategories, ...existentCategories];
+
+    const createdTransactions = transactionsRepository.create(
+      transactions.map(transaction => ({
+        title: transaction.title,
+        type: transaction.type,
+        value: transaction.value,
+        category: finalCategories.find(
+          category => category.title === transaction.category,
+        ),
+      })),
+    );
+
+    await transactionsRepository.save(createdTransactions);
 
     fs.promises.unlink(filePath);
 
-    return transactions;
+    return createdTransactions;
   }
 }
 
